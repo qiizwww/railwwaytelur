@@ -15,6 +15,7 @@ function getEnvOrThrow(key) {
   return value;
 }
 
+// PERBAIKAN:
 function parseServiceAccountFromEnv() {
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (rawJson) {
@@ -26,6 +27,7 @@ function parseServiceAccountFromEnv() {
     };
   }
 
+  // Panggil NAMA VARIABEL yang didaftarkan di Railway
   return {
     projectId: getEnvOrThrow('FIREBASE_PROJECT_ID'),
     clientEmail: getEnvOrThrow('FIREBASE_CLIENT_EMAIL'),
@@ -35,6 +37,7 @@ function parseServiceAccountFromEnv() {
 
 function initFirebase() {
   const { projectId, clientEmail, privateKey } = parseServiceAccountFromEnv();
+  // Panggil NAMA VARIABEL untuk URL database
   const databaseURL = getEnvOrThrow('FIREBASE_DATABASE_URL');
 
   admin.initializeApp({
