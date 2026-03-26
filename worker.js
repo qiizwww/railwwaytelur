@@ -15,10 +15,26 @@ function getEnvOrThrow(key) {
   return value;
 }
 
+function parseServiceAccountFromEnv() {
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (rawJson) {
+    const parsed = JSON.parse(rawJson);
+    return {
+      projectId: parsed.project_id,
+      clientEmail: parsed.client_email,
+      privateKey: String(parsed.private_key || '').replace(/\\n/g, '\n'),
+    };
+  }
+
+  return {
+    projectId: getEnvOrThrow('FIREBASE_PROJECT_ID'),
+    clientEmail: getEnvOrThrow('FIREBASE_CLIENT_EMAIL'),
+    privateKey: getEnvOrThrow('FIREBASE_PRIVATE_KEY').replace(/\\n/g, '\n'),
+  };
+}
+
 function initFirebase() {
-  const projectId = getEnvOrThrow('FIREBASE_PROJECT_ID');
-  const clientEmail = getEnvOrThrow('FIREBASE_CLIENT_EMAIL');
-  const privateKey = getEnvOrThrow('FIREBASE_PRIVATE_KEY').replace(/\\n/g, '\n');
+  const { projectId, clientEmail, privateKey } = parseServiceAccountFromEnv();
   const databaseURL = getEnvOrThrow('FIREBASE_DATABASE_URL');
 
   admin.initializeApp({

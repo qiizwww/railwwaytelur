@@ -29,6 +29,7 @@ Gunakan nilai ini di Railway Variables:
 - `PORT=3000`
 - `TZ=Asia/Jakarta`
 - `SCHEDULER_ENABLED=true`
+- `FIREBASE_SERVICE_ACCOUNT_JSON=<json-service-account-penuh>` (opsi paling mudah)
 - `FIREBASE_PROJECT_ID=telurku-fa78c`
 - `FIREBASE_CLIENT_EMAIL=<service-account-email>`
 - `FIREBASE_PRIVATE_KEY=<private-key-dengan-escaped-newline>`
@@ -37,6 +38,10 @@ Gunakan nilai ini di Railway Variables:
 Catatan untuk `FIREBASE_PRIVATE_KEY`:
 - Gunakan format satu baris dengan `\n` (lihat `.env.example`).
 - Jangan commit private key ke Git.
+
+Catatan untuk `FIREBASE_SERVICE_ACCOUNT_JSON`:
+- Bisa isi seluruh JSON service account dalam satu variable Railway.
+- Tetap jangan taruh nilainya di source code atau file yang di-commit.
 
 ## Deploy di Railway
 
