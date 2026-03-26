@@ -6,6 +6,9 @@ const admin = require('firebase-admin');
 const PORT = Number(process.env.PORT || 3000);
 const TZ = process.env.TZ || 'Asia/Jakarta';
 const SCHEDULER_ENABLED = String(process.env.SCHEDULER_ENABLED || 'true') === 'true';
+const COMPACT_MODE = String(process.env.COMPACT_MODE || 'true') === 'true';
+const RIWAYAT_MAX_RECORDS = Number(process.env.RIWAYAT_MAX_RECORDS || 500);
+const SCHEDULER_RUNS_RETAIN_DAYS = Number(process.env.SCHEDULER_RUNS_RETAIN_DAYS || 14);
 let motorOffTimer = null;
 
 function getEnvOrThrow(key) {
@@ -71,6 +74,11 @@ function formatHHMM(date) {
 function toInt(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
+}
+
+function toDate(value) {
+  const d = new Date(String(value || ''));
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function normalizeKandangKey(kandangId) {
@@ -439,6 +447,82 @@ async function migrateLegacyRiwayatData(kandangMap) {
   }
 }
 
+async function normalizeRecordsNode() {
+  const nestedRef = admin.database().ref('riwayat/records/records');
+  const nestedSnap = await nestedRef.get();
+  if (!nestedSnap.exists() || typeof nestedSnap.val() !== 'object') return;
+
+  const recordsRef = admin.database().ref('riwayat/records');
+  const nestedData = nestedSnap.val();
+
+  for (const [key, value] of Object.entries(nestedData)) {
+    if (!value || typeof value !== 'object') continue;
+    await recordsRef.child(key).set(value);
+  }
+
+  await nestedRef.remove();
+  console.log('[maintenance] Flattened riwayat/records/records into riwayat/records');
+}
+
+async function pruneOldRiwayatRecords(maxRecords) {
+  if (!Number.isFinite(maxRecords) || maxRecords <= 0) return;
+
+  const recordsRef = admin.database().ref('riwayat/records');
+  const snap = await recordsRef.get();
+  if (!snap.exists() || typeof snap.val() !== 'object') return;
+
+  const recordsData = snap.val();
+  const entries = Object.entries(recordsData)
+    .filter(([_, value]) => value && typeof value === 'object')
+    .map(([key, value]) => {
+      const date = toDate(value.tanggal_panen);
+      return { key, time: date ? date.getTime() : 0 };
+    })
+    .sort((a, b) => b.time - a.time);
+
+  if (entries.length <= maxRecords) return;
+
+  const removeUpdates = {};
+  for (const item of entries.slice(maxRecords)) {
+    removeUpdates[item.key] = null;
+  }
+
+  await recordsRef.update(removeUpdates);
+  console.log(`[maintenance] Pruned ${entries.length - maxRecords} old riwayat records (keep ${maxRecords})`);
+}
+
+async function pruneOldSchedulerRuns(retainDays) {
+  if (!Number.isFinite(retainDays) || retainDays < 1) return;
+
+  const runsRef = admin.database().ref('scheduler_runs');
+  const snap = await runsRef.get();
+  if (!snap.exists() || typeof snap.val() !== 'object') return;
+
+  const runs = snap.val();
+  const now = getJakartaNow();
+  const cutoff = new Date(now.getTime() - retainDays * 24 * 60 * 60 * 1000);
+  const removeUpdates = {};
+
+  for (const dateKey of Object.keys(runs)) {
+    const date = toDate(`${dateKey}T00:00:00+07:00`);
+    if (!date) continue;
+    if (date < cutoff) {
+      removeUpdates[dateKey] = null;
+    }
+  }
+
+  if (Object.keys(removeUpdates).length > 0) {
+    await runsRef.update(removeUpdates);
+    console.log(`[maintenance] Pruned old scheduler_runs older than ${retainDays} days`);
+  }
+}
+
+async function runCompactMaintenance() {
+  await normalizeRecordsNode();
+  await pruneOldRiwayatRecords(RIWAYAT_MAX_RECORDS);
+  await pruneOldSchedulerRuns(SCHEDULER_RUNS_RETAIN_DAYS);
+}
+
 async function runForSchedule(jadwalId, jadwal, dataSensor, kandangMap, todayKey) {
   const jam = String(jadwal.jam || '09:00');
   const jenisPanen = detectJenisPanen(jadwal);
@@ -599,6 +683,15 @@ async function bootstrap() {
       console.log('[init] Legacy riwayat migration completed');
     } catch (e) {
       console.error('[error] Legacy riwayat migration failed:', e.message);
+    }
+  }
+
+  if (COMPACT_MODE) {
+    try {
+      await runCompactMaintenance();
+      console.log('[init] Compact maintenance completed');
+    } catch (e) {
+      console.error('[error] Compact maintenance failed:', e.message);
     }
   }
 
