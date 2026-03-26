@@ -104,7 +104,9 @@ function isAllKandangSchedule(jadwal) {
   const kandangNama = String(jadwal.kandangNama || '').toLowerCase().trim();
   return (
     kandangId === 'all' ||
+    kandangId === 'global' ||
     kandangId === 'semua' ||
+    kandangNama.includes('global') ||
     kandangNama.includes('semua') ||
     kandangNama.includes('all')
   );
@@ -274,6 +276,169 @@ async function writeRiwayat({
   });
 }
 
+async function shouldRunMaintenance() {
+  const lockRef = admin.database().ref('maintenance/migration_v2_global_alias');
+  const tx = await lockRef.transaction((current) => {
+    if (current && current.done === true) return current;
+    return {
+      done: true,
+      done_at: new Date().toISOString(),
+      source: 'railway-scheduler',
+    };
+  });
+  return tx.committed;
+}
+
+function looksLikeLegacyRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return 'kandang_id' in value && 'tanggal_panen' in value;
+}
+
+function buildKandangNameMap(kandangMap) {
+  const map = {};
+  for (const kandangId of Object.keys(kandangMap || {})) {
+    const kandang = kandangMap[kandangId];
+    map[kandangId] = String((kandang && kandang.nama) || kandangId);
+  }
+  return map;
+}
+
+function parseDateKeyFromIso(iso) {
+  const date = new Date(String(iso || ''));
+  if (Number.isNaN(date.getTime())) return null;
+  return formatDateKey(date);
+}
+
+async function inferTargetForGlobalRecord(record, kandangMap) {
+  const dateKey = parseDateKeyFromIso(record.tanggal_panen);
+  if (!dateKey) return null;
+
+  const jenis = String(record.jenis_panen || '').toLowerCase();
+  const sessionKey = jenis === 'sore' ? 'sore' : 'pagi';
+  const sessionSnapRef = admin.database().ref(`panen_snapshot/${dateKey}/${sessionKey}`);
+  const sessionSnap = await sessionSnapRef.get();
+  if (!sessionSnap.exists() || typeof sessionSnap.val() !== 'object') return null;
+
+  const snapData = sessionSnap.val();
+  const candidates = [];
+  for (const kandangId of Object.keys(kandangMap || {})) {
+    if (!Object.prototype.hasOwnProperty.call(snapData, kandangId)) continue;
+    const snapVal = toInt(snapData[kandangId]);
+    if (jenis === 'sore') {
+      const deltaKey = `delta_${kandangId}`;
+      const deltaVal = toInt(snapData[deltaKey]);
+      if (deltaVal === toInt(record.jumlah_telur) || snapVal === toInt(record.sensor_snapshot)) {
+        candidates.push(kandangId);
+      }
+    } else if (snapVal === toInt(record.sensor_snapshot) || snapVal === toInt(record.jumlah_telur)) {
+      candidates.push(kandangId);
+    }
+  }
+
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+async function migrateLegacyRiwayatData(kandangMap) {
+  const riwayatRef = admin.database().ref('riwayat');
+  const rootSnap = await riwayatRef.get();
+  if (!rootSnap.exists() || typeof rootSnap.val() !== 'object') {
+    return;
+  }
+
+  const root = rootSnap.val();
+  const recordsRef = admin.database().ref('riwayat/records');
+  const summaryRef = admin.database().ref('riwayat/summary');
+  const kandangNameMap = buildKandangNameMap(kandangMap);
+
+  if (!root.summary && (root.telur_hari_ini != null || root.total_telur != null)) {
+    await summaryRef.update({
+      telur_hari_ini: toInt(root.telur_hari_ini),
+      total_telur: toInt(root.total_telur),
+      last_reset_date: String(root.last_reset_date || formatDateKey(getJakartaNow())),
+      kandang1_hari_ini: toInt(root.kandang1_hari_ini),
+      kandang2_hari_ini: toInt(root.kandang2_hari_ini),
+      updated_at: new Date().toISOString(),
+      migrated_from_legacy: true,
+    });
+  }
+
+  const cleanupUpdates = {};
+
+  for (const [legacyKey, value] of Object.entries(root)) {
+    if (legacyKey === 'records' || legacyKey === 'summary') continue;
+    if (!looksLikeLegacyRecord(value)) {
+      // Hapus field summary lama atau node lama non-record.
+      cleanupUpdates[legacyKey] = null;
+      continue;
+    }
+
+    const record = { ...value };
+    const kandangIdRaw = String(record.kandang_id || '').toLowerCase();
+    const kandangNamaRaw = String(record.kandang_nama || '').toLowerCase();
+    const isGlobal =
+      kandangIdRaw === 'global' ||
+      kandangIdRaw === 'all' ||
+      kandangIdRaw === 'semua' ||
+      kandangNamaRaw.includes('global') ||
+      kandangNamaRaw.includes('semua') ||
+      kandangNamaRaw.includes('all');
+
+    if (!isGlobal) {
+      await recordsRef.push().set({
+        ...record,
+        migrated_from_legacy: true,
+        migrated_at: new Date().toISOString(),
+      });
+      cleanupUpdates[legacyKey] = null;
+      continue;
+    }
+
+    const inferredKandangId = await inferTargetForGlobalRecord(record, kandangMap);
+    if (inferredKandangId) {
+      await recordsRef.push().set({
+        ...record,
+        kandang_id: inferredKandangId,
+        kandang_nama: kandangNameMap[inferredKandangId] || inferredKandangId,
+        migrated_from_global: true,
+        migrated_at: new Date().toISOString(),
+      });
+      cleanupUpdates[legacyKey] = null;
+      continue;
+    }
+
+    // Fallback: jika tidak bisa infer unik, split ke semua kandang aktif.
+    const kandangIds = Object.keys(kandangMap || {});
+    if (kandangIds.length === 0) {
+      cleanupUpdates[legacyKey] = null;
+      continue;
+    }
+
+    const total = toInt(record.jumlah_telur);
+    const base = Math.floor(total / kandangIds.length);
+    let remainder = total % kandangIds.length;
+
+    for (const kandangId of kandangIds) {
+      const porsi = base + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder -= 1;
+
+      await recordsRef.push().set({
+        ...record,
+        kandang_id: kandangId,
+        kandang_nama: kandangNameMap[kandangId] || kandangId,
+        jumlah_telur: porsi,
+        migrated_from_global_split: true,
+        migrated_at: new Date().toISOString(),
+      });
+    }
+
+    cleanupUpdates[legacyKey] = null;
+  }
+
+  if (Object.keys(cleanupUpdates).length > 0) {
+    await riwayatRef.update(cleanupUpdates);
+  }
+}
+
 async function runForSchedule(jadwalId, jadwal, dataSensor, kandangMap, todayKey) {
   const jam = String(jadwal.jam || '09:00');
   const jenisPanen = detectJenisPanen(jadwal);
@@ -423,6 +588,19 @@ function startHealthServer() {
 async function bootstrap() {
   initFirebase();
   startHealthServer();
+
+  const kandangSnap = await admin.database().ref('kontrol/kandang').get();
+  const kandangMap = kandangSnap.exists() ? kandangSnap.val() : {};
+
+  const runMaintenance = await shouldRunMaintenance();
+  if (runMaintenance) {
+    try {
+      await migrateLegacyRiwayatData(kandangMap);
+      console.log('[init] Legacy riwayat migration completed');
+    } catch (e) {
+      console.error('[error] Legacy riwayat migration failed:', e.message);
+    }
+  }
 
   if (!SCHEDULER_ENABLED) {
     console.log('[init] Scheduler disabled by SCHEDULER_ENABLED=false');
