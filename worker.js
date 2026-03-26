@@ -6,6 +6,7 @@ const admin = require('firebase-admin');
 const PORT = Number(process.env.PORT || 3000);
 const TZ = process.env.TZ || 'Asia/Jakarta';
 const SCHEDULER_ENABLED = String(process.env.SCHEDULER_ENABLED || 'true') === 'true';
+let motorOffTimer = null;
 
 function getEnvOrThrow(key) {
   const value = process.env[key];
@@ -77,6 +78,75 @@ function normalizeKandangKey(kandangId) {
   if (id === 'kandang1' || id === 'kandang_1') return 'kandang1';
   if (id === 'kandang2' || id === 'kandang_2') return 'kandang2';
   return 'lainnya';
+}
+
+function parseDurasiMs(durasiRaw) {
+  const text = String(durasiRaw || '').toLowerCase().trim();
+  if (!text) return 30 * 60 * 1000;
+
+  const number = Number.parseInt(text.replace(/[^0-9]/g, ''), 10);
+  if (!Number.isFinite(number) || number <= 0) return 30 * 60 * 1000;
+
+  if (
+    text.includes('jam') ||
+    text.includes('hour') ||
+    text.includes('hours') ||
+    text.includes('hr')
+  ) {
+    return number * 60 * 60 * 1000;
+  }
+
+  return number * 60 * 1000;
+}
+
+function isAllKandangSchedule(jadwal) {
+  const kandangId = String(jadwal.kandangId || '').toLowerCase().trim();
+  const kandangNama = String(jadwal.kandangNama || '').toLowerCase().trim();
+  return (
+    kandangId === 'all' ||
+    kandangId === 'semua' ||
+    kandangNama.includes('semua') ||
+    kandangNama.includes('all')
+  );
+}
+
+function resolveTargetKandangIds(jadwal, kandangMap) {
+  if (isAllKandangSchedule(jadwal)) {
+    const ids = Object.keys(kandangMap || {});
+    if (ids.length > 0) return ids;
+    return ['kandang1', 'kandang2'];
+  }
+
+  const kandangId = String(jadwal.kandangId || '').trim();
+  if (!kandangId) return [];
+  return [kandangId];
+}
+
+async function triggerMotorForDuration(durasiMs, jadwalId) {
+  const ref = admin.database().ref('aktuator');
+  await ref.update({
+    motor: true,
+    last_trigger_by_scheduler: new Date().toISOString(),
+    last_trigger_jadwal: jadwalId,
+    durasi_ms: durasiMs,
+  });
+  console.log(`[ok] Motor ON untuk jadwal ${jadwalId}, durasi ${Math.round(durasiMs / 1000)} detik`);
+
+  if (motorOffTimer) {
+    clearTimeout(motorOffTimer);
+  }
+
+  motorOffTimer = setTimeout(async () => {
+    try {
+      await ref.update({
+        motor: false,
+        last_off_by_scheduler: new Date().toISOString(),
+      });
+      console.log(`[ok] Motor OFF otomatis setelah durasi jadwal ${jadwalId}`);
+    } catch (e) {
+      console.error('[error] Gagal mematikan motor otomatis:', e.message);
+    }
+  }, durasiMs);
 }
 
 function detectJenisPanen(jadwal) {
@@ -205,73 +275,81 @@ async function writeRiwayat({
 }
 
 async function runForSchedule(jadwalId, jadwal, dataSensor, kandangMap, todayKey) {
-  const kandangId = String(jadwal.kandangId || '').trim();
-  const kandangNama = String(jadwal.kandangNama || kandangId || 'Kandang');
   const jam = String(jadwal.jam || '09:00');
   const jenisPanen = detectJenisPanen(jadwal);
+  const durasiMs = parseDurasiMs(jadwal.durasi);
 
-  if (!kandangId) {
-    console.log(`[skip] ${jadwalId}: kandangId kosong`);
+  await triggerMotorForDuration(durasiMs, jadwalId);
+
+  const targetKandangIds = resolveTargetKandangIds(jadwal, kandangMap);
+
+  if (targetKandangIds.length === 0) {
+    console.log(`[skip] ${jadwalId}: target kandang tidak ditemukan`);
     return;
   }
 
-  const lockKey = `${jadwalId}_${jenisPanen}`;
-  const gotLock = await acquireRunLock(todayKey, lockKey);
-  if (!gotLock) {
-    console.log(`[skip] ${jadwalId}: sudah dieksekusi hari ini (${jenisPanen})`);
-    return;
-  }
+  for (const kandangId of targetKandangIds) {
+    const lockKey = `${jadwalId}_${jenisPanen}_${kandangId}`;
+    const gotLock = await acquireRunLock(todayKey, lockKey);
+    if (!gotLock) {
+      console.log(`[skip] ${jadwalId}/${kandangId}: sudah dieksekusi hari ini (${jenisPanen})`);
+      continue;
+    }
 
-  const kandangData = kandangMap[kandangId] || null;
-  const infraPath = resolveInfraPath(kandangId, kandangData);
-  const sensorValue = Number(dataSensor[infraPath] || 0);
+    const kandangData = kandangMap[kandangId] || null;
+    const kandangNama = String(
+      (kandangData && kandangData.nama) || jadwal.kandangNama || kandangId || 'Kandang',
+    );
+    const infraPath = resolveInfraPath(kandangId, kandangData);
+    const sensorValue = Number(dataSensor[infraPath] || 0);
 
-  if (jenisPanen === 'pagi') {
-    await admin.database().ref(`panen_snapshot/${todayKey}/pagi`).update({
+    if (jenisPanen === 'pagi') {
+      await admin.database().ref(`panen_snapshot/${todayKey}/pagi`).update({
+        [kandangId]: sensorValue,
+        timestamp: new Date().toISOString(),
+      });
+
+      await writeRiwayat({
+        kandangId,
+        kandangNama,
+        jumlahTelur: sensorValue,
+        jam,
+        jenisPanen: 'pagi',
+        sensorSnapshot: sensorValue,
+        panenSebelumnya: null,
+        catatan: 'Auto-capture PAGI dari Railway scheduler',
+        dateKey: todayKey,
+      });
+
+      console.log(`[ok] Pagi ${kandangNama}: ${sensorValue} telur (${infraPath})`);
+      continue;
+    }
+
+    const pagiSnapRef = admin.database().ref(`panen_snapshot/${todayKey}/pagi/${kandangId}`);
+    const pagiSnap = await pagiSnapRef.get();
+    const nilaiPagi = pagiSnap.exists() ? Number(pagiSnap.val() || 0) : 0;
+    const delta = Math.max(sensorValue - nilaiPagi, 0);
+
+    await admin.database().ref(`panen_snapshot/${todayKey}/sore`).update({
       [kandangId]: sensorValue,
+      [`delta_${kandangId}`]: delta,
       timestamp: new Date().toISOString(),
     });
 
     await writeRiwayat({
       kandangId,
       kandangNama,
-      jumlahTelur: sensorValue,
+      jumlahTelur: delta,
       jam,
-      jenisPanen: 'pagi',
+      jenisPanen: 'sore',
       sensorSnapshot: sensorValue,
-      panenSebelumnya: null,
-      catatan: 'Auto-capture PAGI dari Railway scheduler',
+      panenSebelumnya: nilaiPagi,
+      catatan: `Auto-capture SORE dari Railway scheduler (delta: ${sensorValue} - ${nilaiPagi})`,
       dateKey: todayKey,
     });
 
-    console.log(`[ok] Pagi ${kandangNama}: ${sensorValue} telur (${infraPath})`);
-    return;
+    console.log(`[ok] Sore ${kandangNama}: ${delta} telur (${sensorValue}-${nilaiPagi})`);
   }
-
-  const pagiSnapRef = admin.database().ref(`panen_snapshot/${todayKey}/pagi/${kandangId}`);
-  const pagiSnap = await pagiSnapRef.get();
-  const nilaiPagi = pagiSnap.exists() ? Number(pagiSnap.val() || 0) : 0;
-  const delta = Math.max(sensorValue - nilaiPagi, 0);
-
-  await admin.database().ref(`panen_snapshot/${todayKey}/sore`).update({
-    [kandangId]: sensorValue,
-    [`delta_${kandangId}`]: delta,
-    timestamp: new Date().toISOString(),
-  });
-
-  await writeRiwayat({
-    kandangId,
-    kandangNama,
-    jumlahTelur: delta,
-    jam,
-    jenisPanen: 'sore',
-    sensorSnapshot: sensorValue,
-    panenSebelumnya: nilaiPagi,
-    catatan: `Auto-capture SORE dari Railway scheduler (delta: ${sensorValue} - ${nilaiPagi})`,
-    dateKey: todayKey,
-  });
-
-  console.log(`[ok] Sore ${kandangNama}: ${delta} telur (${sensorValue}-${nilaiPagi})`);
 }
 
 async function runTick() {
