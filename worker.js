@@ -80,10 +80,14 @@ function toDate(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function normalizeKandangKey(kandangId) {
-  const id = String(kandangId || '').toLowerCase();
-  if (id === 'kandang1' || id === 'kandang_1') return 'kandang1';
-  if (id === 'kandang2' || id === 'kandang_2') return 'kandang2';
+function normalizeKandangKey(kandangId, kandangNama) {
+  const rawId = String(kandangId || '').toLowerCase();
+  const rawNama = String(kandangNama || '').toLowerCase();
+  const merged = `${rawId} ${rawNama}`;
+  const compact = merged.replace(/[^a-z0-9]/g, '');
+
+  if (compact.includes('kandang1')) return 'kandang1';
+  if (compact.includes('kandang2')) return 'kandang2';
   return 'lainnya';
 }
 
@@ -165,9 +169,9 @@ async function acquireRunLock(todayKey, lockKey) {
   return tx.committed;
 }
 
-async function updateRiwayatSummary({ kandangId, jumlahTelur, dateKey }) {
+async function updateRiwayatSummary({ kandangId, kandangNama, jumlahTelur, dateKey }) {
   const summaryRef = admin.database().ref('riwayat/summary');
-  const kandangKey = normalizeKandangKey(kandangId);
+  const kandangKey = normalizeKandangKey(kandangId, kandangNama);
   const totalAdd = toInt(jumlahTelur);
 
   await summaryRef.transaction((current) => {
@@ -251,6 +255,7 @@ async function writeRiwayat({
 
   await updateRiwayatSummary({
     kandangId,
+    kandangNama,
     jumlahTelur: jumlah,
     dateKey,
   });
