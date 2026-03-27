@@ -9,7 +9,6 @@ const SCHEDULER_ENABLED = String(process.env.SCHEDULER_ENABLED || 'true') === 't
 const COMPACT_MODE = String(process.env.COMPACT_MODE || 'true') === 'true';
 const RIWAYAT_MAX_RECORDS = Number(process.env.RIWAYAT_MAX_RECORDS || 500);
 const SCHEDULER_RUNS_RETAIN_DAYS = Number(process.env.SCHEDULER_RUNS_RETAIN_DAYS || 14);
-let motorOffTimer = null;
 
 function getEnvOrThrow(key) {
   const value = process.env[key];
@@ -130,33 +129,6 @@ function resolveTargetKandangIds(jadwal, kandangMap) {
   const kandangId = String(jadwal.kandangId || '').trim();
   if (!kandangId) return [];
   return [kandangId];
-}
-
-async function triggerMotorForDuration(durasiMs, jadwalId) {
-  const ref = admin.database().ref('aktuator');
-  await ref.update({
-    motor: true,
-    last_trigger_by_scheduler: new Date().toISOString(),
-    last_trigger_jadwal: jadwalId,
-    durasi_ms: durasiMs,
-  });
-  console.log(`[ok] Motor ON untuk jadwal ${jadwalId}, durasi ${Math.round(durasiMs / 1000)} detik`);
-
-  if (motorOffTimer) {
-    clearTimeout(motorOffTimer);
-  }
-
-  motorOffTimer = setTimeout(async () => {
-    try {
-      await ref.update({
-        motor: false,
-        last_off_by_scheduler: new Date().toISOString(),
-      });
-      console.log(`[ok] Motor OFF otomatis setelah durasi jadwal ${jadwalId}`);
-    } catch (e) {
-      console.error('[error] Gagal mematikan motor otomatis:', e.message);
-    }
-  }, durasiMs);
 }
 
 function detectJenisPanen(jadwal) {
@@ -528,7 +500,11 @@ async function runForSchedule(jadwalId, jadwal, dataSensor, kandangMap, todayKey
   const jenisPanen = detectJenisPanen(jadwal);
   const durasiMs = parseDurasiMs(jadwal.durasi);
 
-  await triggerMotorForDuration(durasiMs, jadwalId);
+  console.log(
+    `[info] ${jadwalId}: trigger motor dilewati di worker (durasi jadwal ${Math.round(
+      durasiMs / 1000,
+    )} detik), aktuator dikendalikan EPS/main.cpp`,
+  );
 
   const targetKandangIds = resolveTargetKandangIds(jadwal, kandangMap);
 
